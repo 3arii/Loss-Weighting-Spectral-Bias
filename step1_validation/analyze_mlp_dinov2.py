@@ -168,8 +168,9 @@ def analyze_experiment(exp_dir: str, output_dir: str = None,
     # Save emergence dataframe
     df.to_csv(os.path.join(output_dir, f"{exp_name}_emergence.csv"), index=False)
 
-    # Save summary
-    summary = {k: v for k, v in result.items() if k != "df" and k != "fit"}
+    # Save summary (cast numpy scalars to native Python types for JSON)
+    summary = {k: (float(v) if hasattr(v, "item") else v)
+               for k, v in result.items() if k not in ("df", "fit")}
     with open(os.path.join(output_dir, f"{exp_name}_summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
