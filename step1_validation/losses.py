@@ -3,8 +3,12 @@
 DeterministicPowerLawLoss: power-law w(sigma) = sigma^beta with weight normalization.
 GeneralWeightingLoss: arbitrary w(sigma) from get_weighting() for named schemes.
 
-Both use deterministic sigma integration (K fixed log-spaced sigma values per step)
-and vectorized computation (all sigma values in one batched matmul).
+Both use deterministic sigma integration (K=50-100 fixed log-spaced sigma values per step).
+The inner loop calls net(x_noisy, sigma) generically, so both LinearDenoiserShared and
+MLPDenoiser are supported without modification.
+
+Vectorization: noisy inputs are stacked as [K*N, d] and passed in one forward call.
+Each of the K sigma values is repeated N times to match samples.
 """
 
 import sys
@@ -48,17 +52,19 @@ class DeterministicPowerLawLoss:
         sigmas = self.sigmas.to(device)
         weights = self.weights.to(device)
 
-        # Vectorized: all K sigma values in one pass
-        X_exp = X.unsqueeze(0).expand(K, -1, -1)           # [K, N, d]
-        noise = torch.randn(K, N, d, device=device) * sigmas.view(K, 1, 1)
-        X_noisy = X_exp + noise                              # [K, N, d]
+        # Build [K, N, d] noisy inputs
+        X_exp   = X.unsqueeze(0).expand(K, -1, -1)                    # [K, N, d]
+        noise   = torch.randn(K, N, d, device=device) * sigmas.view(K, 1, 1)
+        X_noisy = X_exp + noise                                        # [K, N, d]
 
-        # Single batched matmul
-        D_out = X_noisy.reshape(K * N, d) @ net.W.T + net.b  # [K*N, d]
-        D_out = D_out.reshape(K, N, d)
+        # Flatten to [K*N, d] and build matching sigma vector [K*N]
+        # then call net generically — works for LinearDenoiserShared and MLPDenoiser
+        x_flat     = X_noisy.reshape(K * N, d)
+        sigma_flat = sigmas.view(K, 1).expand(K, N).reshape(K * N)    # [K*N]
+        D_out      = net(x_flat, sigma_flat).reshape(K, N, d)         # [K, N, d]
 
         # Per-sigma MSE, averaged over samples and dimensions
-        mse = ((D_out - X_exp)**2).sum(dim=-1).mean(dim=-1)  # [K]
+        mse = ((D_out - X_exp) ** 2).sum(dim=-1).mean(dim=-1)         # [K]
 
         return (weights * mse).mean()
 
@@ -97,9 +103,10 @@ class GeneralWeightingLoss:
         noise = torch.randn(K, N, d, device=device) * sigmas.view(K, 1, 1)
         X_noisy = X_exp + noise
 
-        D_out = X_noisy.reshape(K * N, d) @ net.W.T + net.b
-        D_out = D_out.reshape(K, N, d)
+        x_flat     = X_noisy.reshape(K * N, d)
+        sigma_flat = sigmas.view(K, 1).expand(K, N).reshape(K * N)
+        D_out      = net(x_flat, sigma_flat).reshape(K, N, d)
 
-        mse = ((D_out - X_exp)**2).sum(dim=-1).mean(dim=-1)
+        mse = ((D_out - X_exp) ** 2).sum(dim=-1).mean(dim=-1)
 
         return (weights * mse).mean()
