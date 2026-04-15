@@ -15,6 +15,30 @@ returns NaN (requires n_used ≥ 3).
 
 ---
 
+## Pre-check — Weight magnitude at σ_min and σ_max
+
+Before tracing the code, evaluate how large w(σ) = σ^β gets across the σ range:
+
+```python
+sigma_min, sigma_max = 0.002, 80.0
+beta = 2.5
+
+w(sigma_min) = 0.002^2.5 = 1.79e-7
+w(sigma_max) = 80.0^2.5  = 5.72e+4
+ratio         = (80/0.002)^2.5 = 3.20e+11   (11.5 decades)
+```
+
+| σ | w(σ) = σ^2.5 |
+|---|---|
+| 0.002 (σ_min) | 1.79e-7 |
+| 80.0 (σ_max) | **5.72e+4** |
+| ratio max/min | **3.20e+11** (11.5 decades) |
+
+The weight function spans **11.5 orders of magnitude** across the σ range.
+This extreme dynamic range is the upstream cause of all downstream issues.
+
+---
+
 ## Check 1 — Exponent overflow in `psi_k_vectorized`
 
 The per-sigma ODE exponent is:
