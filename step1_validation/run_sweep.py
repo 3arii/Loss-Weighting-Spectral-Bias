@@ -1,7 +1,10 @@
-"""Train shared-W linear denoiser with power-law loss weighting.
+"""Train per-sigma linear denoiser with power-law loss weighting.
+
+Each sigma level has its own independent diagonal denoiser.
+This matches the theory setup exactly, so trained alpha should match Phi integral.
 
 Usage:
-    python -m step1_validation.run_sweep --beta -1.0 --alpha_data 1.0 --ndim 200 --seed 42 --output_dir results
+    python -m step1_validation.run_sweep --beta 0.0 --alpha_data 1.0 --ndim 200 --seed 42
 """
 
 import argparse
@@ -16,11 +19,10 @@ from .config import (
     N_CHECKPOINTS, ETA, Q_K, THRESHOLD_FRAC,
     get_sigma_grid_np, get_checkpoint_steps, make_eigenvalues,
 )
-from .models import LinearDenoiserShared
-from .losses import DeterministicPowerLawLoss
+from .models import LinearDenoiserPerSigma
+from .losses import PerSigmaPowerLawLoss
 from .theory import (
-    compute_phi_per_sigma, compute_A_k, compute_shared_w_variance,
-    compute_emergence_times, compute_emergence_times_ak, fit_power_law,
+    compute_phi_per_sigma, compute_emergence_times, fit_power_law,
 )
 
 
@@ -37,14 +39,10 @@ def generate_data(alpha_data, ndim, n_samples, seed):
     return torch.tensor(X, dtype=torch.float32), eigenvalues
 
 
-def compute_theory(eigenvalues, beta, sigma_grid_np, w_values_np):
-    """All theory predictions for one config."""
-    d = len(eigenvalues)
-
-    # 1. Heuristic
+def compute_theory(eigenvalues, beta):
+    """Phi integral predictions (no training needed)."""
     alpha_heuristic = 1.0 + beta / 2.0
 
-    # 2. Per-sigma Phi integral
     tau_theory = np.geomspace(1e-2, 1e6, 500)
     w_fn = lambda sigma: sigma ** beta
     var_phi = compute_phi_per_sigma(tau_theory, eigenvalues, q_k=Q_K, eta=ETA,
@@ -52,46 +50,57 @@ def compute_theory(eigenvalues, beta, sigma_grid_np, w_values_np):
     tau_phi = compute_emergence_times(var_phi, tau_theory, eigenvalues)
     fit_phi = fit_power_law(tau_phi, eigenvalues)
 
-    # 3. Shared-W theory (a_k-based emergence)
-    A_k, a_k_star, sigma_eff_sq = compute_A_k(eigenvalues, w_values_np, sigma_grid_np)
-    A_max = (w_values_np * (eigenvalues[0] + sigma_grid_np**2)).mean()
-    A_k_norm = A_k / A_max
-    a_k_star_norm = eigenvalues * (w_values_np.mean() / A_max) / A_k_norm
-
-    # Analytical a_k trajectory
-    a_k_traj = a_k_star_norm[None, :] * (1.0 - np.exp(-2.0 * ETA * tau_theory[:, None] * A_k_norm[None, :]))
-    tau_ak = compute_emergence_times_ak(a_k_traj, tau_theory, a_k_star_norm, 0.9)
-    fit_ak = fit_power_law(tau_ak, eigenvalues)
-
-    # Inaccessible modes (sampling ODE)
-    var_inf = compute_shared_w_variance(a_k_star_norm)
-    n_inaccessible = int(np.sum(var_inf < THRESHOLD_FRAC * eigenvalues))
-
     return {
         "alpha_heuristic": alpha_heuristic,
         "alpha_phi": fit_phi["alpha"],
         "alpha_phi_R2": fit_phi["R2"],
         "alpha_phi_n_used": fit_phi["n_used"],
-        "alpha_shared_W_ak_theory": fit_ak["alpha"],
-        "alpha_shared_W_ak_theory_R2": fit_ak["R2"],
-        "sigma_eff_squared": float(sigma_eff_sq),
-        "n_inaccessible": n_inaccessible,
-        "A_k_norm": A_k_norm.tolist(),
-        "a_k_star_norm": a_k_star_norm.tolist(),
+        "emergence_times_phi": np.where(np.isnan(tau_phi), None, tau_phi).tolist(),
     }
 
 
-def train(X, eigenvalues, beta, ndim, lr, max_steps, device, a_k_star_norm):
-    """Train and measure emergence."""
-    model = LinearDenoiserShared(ndim).to(device)
-    loss_fn = DeterministicPowerLawLoss(beta, lambda_max=float(eigenvalues[0]))
+def compute_generated_variance_per_sigma(model, sigma_grid, sigma_0, sigma_T):
+    """Compute lambda_tilde_k from per-sigma a_k values using the Phi integral formula.
+
+    For per-sigma model with constant a_k(sigma_j) at each sigma:
+        Phi_k(sigma) = exp(-integral (psi_k - 1)/s ds)
+
+    Since psi_k(sigma_j) = a_k[j] (the learned diagonal), and psi varies with sigma,
+    we numerically integrate using the a_k values at the sigma grid points.
+
+    lambda_tilde_k = sigma_T^2 * (Phi_k(sigma_0) / Phi_k(sigma_T))^2
+    """
+    # a_k: [K_sigma, d] from model parameters
+    a_k = model.a_k.data.cpu().numpy()  # [K, d]
+    K = len(sigma_grid)
+
+    # Integrate (a_k - 1) in log-sigma space using trapezoidal rule
+    # The integrand at each sigma_j is (a_k[j] - 1), integrated in log(sigma)
+    log_sigma = np.log(sigma_grid)
+
+    integrand = a_k - 1.0  # [K, d]
+
+    # Trapezoidal integration over log-sigma from sigma_0 to sigma_T
+    # This gives log(Phi_0/Phi_T) = integral_{ln(sigma_0)}^{ln(sigma_T)} (psi-1) d(ln sigma)
+    log_ratio = np.trapz(integrand, log_sigma, axis=0)  # [d]
+
+    lambda_tilde = sigma_T**2 * np.exp(2.0 * log_ratio)
+    return lambda_tilde
+
+
+def train(X, eigenvalues, beta, ndim, lr, max_steps, device):
+    """Train per-sigma model and measure emergence via generated variance."""
+    K = K_SIGMA
+    model = LinearDenoiserPerSigma(ndim, K).to(device)
+    loss_fn = PerSigmaPowerLawLoss(beta, lambda_max=float(eigenvalues[0]))
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     X_dev = X.to(device)
 
+    sigma_grid = get_sigma_grid_np()
     ckpt_steps = get_checkpoint_steps(max_steps, N_CHECKPOINTS)
     ckpt_set = set(ckpt_steps.tolist())
 
-    a_k_list, ckpt_list, loss_list = [], [], []
+    var_list, ckpt_list, loss_list = [], [], []
     max_grad = 0.0
 
     t0 = time.time()
@@ -106,33 +115,27 @@ def train(X, eigenvalues, beta, ndim, lr, max_steps, device, a_k_star_norm):
         if step % 50 == 0:
             loss_list.append(float(loss.item()))
         if step in ckpt_set:
-            a_k_list.append(model.W.data.diag().cpu().numpy().copy())
+            lam_tilde = compute_generated_variance_per_sigma(
+                model, sigma_grid, SIGMA_0, SIGMA_T)
+            var_list.append(lam_tilde)
             ckpt_list.append(step)
 
     train_time = time.time() - t0
-    a_k_traj = np.array(a_k_list)
+    var_traj = np.array(var_list)  # [n_ckpt, d]
     ckpt_arr = np.array(ckpt_list, dtype=np.float64)
 
-    # Sampling-based emergence
-    var_traj = compute_shared_w_variance(a_k_traj)
-    tau_samp = compute_emergence_times(var_traj, ckpt_arr, eigenvalues)
-    fit_samp = fit_power_law(tau_samp, eigenvalues)
-
-    # a_k-based emergence
-    tau_ak = compute_emergence_times_ak(a_k_traj, ckpt_arr,
-                                        np.array(a_k_star_norm), 0.9)
-    fit_ak = fit_power_law(tau_ak, eigenvalues)
+    # Emergence times from generated variance
+    tau_trained = compute_emergence_times(var_traj, ckpt_arr, eigenvalues)
+    fit_trained = fit_power_law(tau_trained, eigenvalues)
 
     return {
-        "a_k_traj": a_k_traj.tolist(),
         "var_traj": var_traj.tolist(),
         "ckpt_steps": ckpt_list,
-        "alpha_trained_sampling": fit_samp["alpha"],
-        "alpha_trained_sampling_R2": fit_samp["R2"],
-        "n_emerged_sampling": int(np.sum(np.isfinite(tau_samp))),
-        "alpha_trained_ak": fit_ak["alpha"],
-        "alpha_trained_ak_R2": fit_ak["R2"],
-        "n_emerged_ak": int(np.sum(np.isfinite(tau_ak))),
+        "emergence_times_trained": np.where(np.isnan(tau_trained), None, tau_trained).tolist(),
+        "alpha_trained": fit_trained["alpha"],
+        "alpha_trained_R2": fit_trained["R2"],
+        "alpha_trained_n_used": fit_trained["n_used"],
+        "n_emerged": int(np.sum(np.isfinite(tau_trained))),
         "loss_traj": loss_list,
         "max_grad_norm": max_grad,
         "train_time_s": train_time,
@@ -158,21 +161,18 @@ def main():
           f"seed={args.seed} device={args.device}")
 
     X, eigenvalues = generate_data(args.alpha_data, args.ndim, args.n_samples, args.seed)
-    sigma_grid = get_sigma_grid_np()
-    w_values = sigma_grid ** args.beta
 
     print("Theory...")
-    theory = compute_theory(eigenvalues, args.beta, sigma_grid, w_values)
+    theory = compute_theory(eigenvalues, args.beta)
     print(f"  heuristic={_fmt(theory['alpha_heuristic'])}  "
-          f"phi={_fmt(theory['alpha_phi'])} (R2={_fmt(theory['alpha_phi_R2'])})  "
-          f"inacc={theory['n_inaccessible']}/{args.ndim}")
+          f"phi={_fmt(theory['alpha_phi'])} (R2={_fmt(theory['alpha_phi_R2'])})")
 
-    print(f"Training {args.max_steps} steps...")
+    print(f"Training {args.max_steps} steps (per-sigma model, K={K_SIGMA})...")
     trained = train(X, eigenvalues, args.beta, args.ndim, args.lr,
-                    args.max_steps, args.device, theory["a_k_star_norm"])
-    print(f"  ak={_fmt(trained['alpha_trained_ak'])} "
-          f"(R2={_fmt(trained['alpha_trained_ak_R2'])}, "
-          f"emerged={trained['n_emerged_ak']}/{args.ndim})  "
+                    args.max_steps, args.device)
+    print(f"  alpha_trained={_fmt(trained['alpha_trained'])} "
+          f"(R2={_fmt(trained['alpha_trained_R2'])}, "
+          f"emerged={trained['n_emerged']}/{args.ndim})  "
           f"time={trained['train_time_s']:.0f}s")
 
     result = {
