@@ -8,9 +8,12 @@ SIGMA_0 = 0.002
 SIGMA_T = 80.0
 K_SIGMA = 50
 
-# Training
-LR = 0.01
-MAX_STEPS = 50000
+# Training — LR=2.0 is below the SGD stability limit (~2.86 for beta=0)
+# and 150k steps gives tau_max ≈ 16 theory units, enough for ~13/20 modes (d=20)
+# or ~50+ modes (d=200) to emerge for a reliable power-law fit.
+# Step-to-theory-time: tau = step * lr / (K * A_max), where A_max ≈ 366 for beta=0.
+LR = 2.0
+MAX_STEPS = 150000
 N_SAMPLES = 10000
 GRAD_CLIP_NORM = 100.0
 

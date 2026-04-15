@@ -10,10 +10,12 @@ class PerSigmaPowerLawLoss:
     """Per-sigma loss: each sigma_j has its own independent denoiser.
 
     This matches the theory exactly. The loss is:
-        L = (1/K) * sum_j  w(sigma_j) * E[ || D_j(x + sigma_j*z) - x ||^2 ]
+        L = (1/K) * sum_j  w(sigma_j)/A_max * E[ || D_j(x + sigma_j*z) - x ||^2 ]
 
     Each D_j has its own parameters (independent across sigma).
-    Weight normalization ensures lr stability across all beta.
+    A_max = mean(w(sigma_j)*(lambda_max+sigma_j^2)) normalizes so that the SGD
+    stability limit is ~O(1) across all beta values (not beta-dependent).
+    Step-to-theory-time conversion: tau = step * lr / (K * A_max).
     """
 
     def __init__(self, beta, K_sigma=K_SIGMA, sigma_min=SIGMA_0, sigma_max=SIGMA_T,
