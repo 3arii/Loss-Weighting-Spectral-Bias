@@ -26,7 +26,8 @@ Q_K = 0.0        # initial overlap (zero init: W=0 => a_k=0)
 SIGMA_DATA = 0.5  # EDM convention
 
 # Sweep grid
-BETA_VALUES = [-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
+# β=2.5 dropped: only 1/200 modes emerges within τ_max (see DIAGNOSIS_beta2p5_nan.md)
+BETA_VALUES = [-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]
 ALPHA_DATA_VALUES = [0.56, 1.0, 2.0]
 D_VALUES = [200, 768]
 SEEDS = [42, 43, 44, 45, 46]
