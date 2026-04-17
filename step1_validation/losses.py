@@ -19,11 +19,14 @@ class PerSigmaPowerLawLoss:
     """
 
     def __init__(self, beta, K_sigma=K_SIGMA, sigma_min=SIGMA_0, sigma_max=SIGMA_T,
-                 lambda_max=1.0):
+                 lambda_max=1.0, w_max=None):
         self.beta = beta
         self.K_sigma = K_sigma
+        self.w_max = w_max
         self.sigmas = torch.logspace(log10(sigma_min), log10(sigma_max), K_sigma)
         raw_weights = self.sigmas ** beta
+        if w_max is not None:
+            raw_weights = torch.clamp(raw_weights, 1.0 / w_max, w_max)
         A_max = (raw_weights * (lambda_max + self.sigmas**2)).mean()
         self.weights = raw_weights / A_max
         self.normalization_factor = float(A_max)

@@ -39,12 +39,15 @@ def generate_data(alpha_data, ndim, n_samples, seed):
     return torch.tensor(X, dtype=torch.float32), eigenvalues
 
 
-def compute_theory(eigenvalues, beta):
+def compute_theory(eigenvalues, beta, w_max=None):
     """Phi integral predictions (no training needed)."""
     alpha_heuristic = 1.0 + beta / 2.0
 
     tau_theory = np.geomspace(1e-2, 1e6, 500)
-    w_fn = lambda sigma: sigma ** beta
+    if w_max is not None:
+        w_fn = lambda sigma: np.clip(sigma ** beta, 1.0 / w_max, w_max)
+    else:
+        w_fn = lambda sigma: sigma ** beta
     var_phi = compute_phi_per_sigma(tau_theory, eigenvalues, q_k=Q_K, eta=ETA,
                                     w_fn=w_fn, n_quad=100)
     tau_phi = compute_emergence_times(var_phi, tau_theory, eigenvalues)
@@ -88,11 +91,11 @@ def compute_generated_variance_per_sigma(model, sigma_grid, sigma_0, sigma_T):
     return lambda_tilde
 
 
-def train(X, eigenvalues, beta, ndim, lr, max_steps, device):
+def train(X, eigenvalues, beta, ndim, lr, max_steps, device, w_max=None):
     """Train per-sigma model and measure emergence via generated variance."""
     K = K_SIGMA
     model = LinearDenoiserPerSigma(ndim, K).to(device)
-    loss_fn = PerSigmaPowerLawLoss(beta, lambda_max=float(eigenvalues[0]))
+    loss_fn = PerSigmaPowerLawLoss(beta, lambda_max=float(eigenvalues[0]), w_max=w_max)
     optimizer = torch.optim.SGD(model.parameters(), lr=lr)
     X_dev = X.to(device)
 
@@ -152,6 +155,8 @@ def main():
     p.add_argument("--max_steps", type=int, default=MAX_STEPS)
     p.add_argument("--n_samples", type=int, default=N_SAMPLES)
     p.add_argument("--output_dir", type=str, default="results")
+    p.add_argument("--w_max", type=float, default=None,
+                   help="Clamp w(sigma) to [1/w_max, w_max]. None = no clamping.")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
@@ -163,13 +168,13 @@ def main():
     X, eigenvalues = generate_data(args.alpha_data, args.ndim, args.n_samples, args.seed)
 
     print("Theory...")
-    theory = compute_theory(eigenvalues, args.beta)
+    theory = compute_theory(eigenvalues, args.beta, w_max=args.w_max)
     print(f"  heuristic={_fmt(theory['alpha_heuristic'])}  "
           f"phi={_fmt(theory['alpha_phi'])} (R2={_fmt(theory['alpha_phi_R2'])})")
 
     print(f"Training {args.max_steps} steps (per-sigma model, K={K_SIGMA})...")
     trained = train(X, eigenvalues, args.beta, args.ndim, args.lr,
-                    args.max_steps, args.device)
+                    args.max_steps, args.device, w_max=args.w_max)
     print(f"  alpha_trained={_fmt(trained['alpha_trained'])} "
           f"(R2={_fmt(trained['alpha_trained_R2'])}, "
           f"emerged={trained['n_emerged']}/{args.ndim})  "
