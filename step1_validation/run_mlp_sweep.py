@@ -124,7 +124,13 @@ def train(args, X, eigenvalues, sigma_data, device):
         sigma_min=args.sigma_min, sigma_max=args.sigma_max,
         w_max=args.w_max, normalize=args.weight_norm,
     )
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.optimizer == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    elif args.optimizer == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
+                                    momentum=args.momentum)
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}")
     X_dev = X.to(device)
     N = X_dev.shape[0]
 
@@ -206,6 +212,13 @@ def main():
                    help="Clip pre-optimizer grad L2 norm. MLP needs ~10+; 1.0 saturates.")
     p.add_argument("--warmup_steps", type=int, default=500,
                    help="Linear LR warmup steps. Prevents initial-descent trap.")
+    p.add_argument("--optimizer", type=str, default="adam",
+                   choices=["adam", "sgd"],
+                   help="adam flattens per-mode rates via second-moment "
+                        "adaptation. sgd preserves the lambda_k-scaled "
+                        "gradient structure the phi-integral theory assumes.")
+    p.add_argument("--momentum", type=float, default=0.9,
+                   help="SGD momentum (ignored under Adam).")
 
     p.add_argument("--model_type", type=str, default="pure",
                    choices=["pure", "edm"],
@@ -273,7 +286,10 @@ def main():
           f"(R2={_fmt(theory['alpha_sharedW_R2'])})")
 
     print(f"Training {args.max_steps} steps "
-          f"(model={args.model_type}, Adam lr={args.lr})...")
+          f"(model={args.model_type}, opt={args.optimizer}, "
+          f"lr={args.lr}"
+          + (f", mom={args.momentum}" if args.optimizer == "sgd" else "")
+          + ")...")
     trained = train(args, X, eigenvalues, sigma_data, args.device)
     print(f"  alpha_trained={_fmt(trained['alpha_trained'])} "
           f"(R2={_fmt(trained['alpha_trained_R2'])}, "
@@ -288,7 +304,8 @@ def main():
         **trained,
     }
 
-    fname = (f"mlp_{args.model_type}_b{args.beta:+.1f}_a{args.alpha_data:.2f}"
+    fname = (f"mlp_{args.model_type}_{args.optimizer}"
+             f"_b{args.beta:+.1f}_a{args.alpha_data:.2f}"
              f"_d{args.ndim}_h{args.nhidden}_l{args.nlayers}_s{args.seed}.json")
     path = os.path.join(args.output_dir, fname)
     with open(path, "w") as f:
