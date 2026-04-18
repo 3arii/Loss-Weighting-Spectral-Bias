@@ -89,6 +89,11 @@ def train(args, X, eigenvalues, device):
     X_dev = X.to(device)
     N = X_dev.shape[0]
 
+    def lr_at(step):
+        if args.warmup_steps <= 0 or step >= args.warmup_steps:
+            return args.lr
+        return args.lr * (step + 1) / args.warmup_steps
+
     ckpt_steps = get_checkpoint_steps(args.max_steps, args.n_checkpoints)
     ckpt_set = set(ckpt_steps.tolist())
 
@@ -97,6 +102,9 @@ def train(args, X, eigenvalues, device):
     t0 = time.time()
 
     for step in range(args.max_steps):
+        for g in optimizer.param_groups:
+            g["lr"] = lr_at(step)
+
         idx = torch.randint(0, N, (args.batch_size,), device=device)
         xb = X_dev[idx]
 
@@ -155,7 +163,10 @@ def main():
     p.add_argument("--max_steps", type=int, default=50000)
     p.add_argument("--n_samples", type=int, default=N_SAMPLES)
     p.add_argument("--batch_size", type=int, default=512)
-    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--grad_clip", type=float, default=10.0,
+                   help="Clip pre-optimizer grad L2 norm. MLP needs ~10+; 1.0 saturates.")
+    p.add_argument("--warmup_steps", type=int, default=500,
+                   help="Linear LR warmup steps. Prevents initial-descent trap.")
 
     p.add_argument("--nlayers", type=int, default=4)
     p.add_argument("--nhidden", type=int, default=256)

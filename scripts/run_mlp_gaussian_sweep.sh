@@ -33,15 +33,17 @@ $PYTHON -m step1_validation.run_mlp_sweep \
     --ndim 20 \
     --seed 42 \
     --lr 1e-3 \
-    --max_steps 50000 \
+    --warmup_steps 500 \
+    --grad_clip 10.0 \
+    --max_steps 100000 \
     --batch_size 512 \
     --nhidden 256 \
     --nlayers 4 \
     --k_sigma 50 \
     --weight_norm mean \
     --n_checkpoints 80 \
-    --n_eval_samples 2000 \
-    --num_ode_steps 30 \
+    --n_eval_samples 5000 \
+    --num_ode_steps 40 \
     --output_dir $STORE_DIR/step1_results/mlp_gaussian_sweep \
     --device cuda
 
