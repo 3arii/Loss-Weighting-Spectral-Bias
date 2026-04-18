@@ -19,11 +19,12 @@ from .config import (
     SIGMA_0, SIGMA_T, K_SIGMA, N_SAMPLES,
     ETA, Q_K, get_checkpoint_steps, make_eigenvalues,
 )
-from .models import MLPDenoiser
+from .models import MLPDenoiser, EDMMLPDenoiser
 from .losses import SharedMLPPowerLawLoss
 from .sampling import generated_variance_per_mode
 from .theory import (
-    compute_phi_per_sigma, compute_emergence_times, fit_power_law,
+    compute_phi_per_sigma, compute_shared_w_trajectory,
+    compute_emergence_times, fit_power_law,
 )
 
 
@@ -40,11 +41,18 @@ def generate_data(alpha_data, ndim, n_samples, seed):
     return torch.tensor(X, dtype=torch.float32), eigenvalues
 
 
-def compute_theory(eigenvalues, beta, w_max=None, normalize="mean"):
-    """Phi-integral prediction with matching loss-weight normalization."""
+def compute_theory(eigenvalues, beta, sigma_min, sigma_max, k_sigma,
+                   w_max=None, normalize="mean"):
+    """Return both per-sigma (phi-integral) and shared-W theory predictions.
+
+    The per-sigma prediction assumes each sigma has independent parameters —
+    it is the "ideal" case the main paper derives. Shared-W applies to shared
+    weights (shared MLP in the convex/fixed-point limit). Under our MLP
+    architecture, shared-W is the structurally correct comparator.
+    """
     tau_theory = np.geomspace(1e-2, 1e6, 500)
 
-    sigmas_np = np.logspace(np.log10(SIGMA_0), np.log10(SIGMA_T), K_SIGMA)
+    sigmas_np = np.logspace(np.log10(sigma_min), np.log10(sigma_max), k_sigma)
     raw = sigmas_np ** beta
     if w_max is not None:
         raw = np.clip(raw, 1.0 / w_max, w_max)
@@ -61,28 +69,59 @@ def compute_theory(eigenvalues, beta, w_max=None, normalize="mean"):
             val = np.clip(val, 1.0 / w_max, w_max)
         return val / norm_const
 
+    # --- per-sigma (phi integral, Gauss-Legendre) ---
     var_phi = compute_phi_per_sigma(tau_theory, eigenvalues, q_k=Q_K, eta=ETA,
-                                    w_fn=w_fn, n_quad=100)
+                                    w_fn=w_fn, sigma_0=sigma_min,
+                                    sigma_T=sigma_max, n_quad=100)
     tau_phi = compute_emergence_times(var_phi, tau_theory, eigenvalues)
     fit_phi = fit_power_law(tau_phi, eigenvalues)
+
+    # --- shared-W (A_k = E_sigma[w * (lam + sigma^2)]) ---
+    w_vals = raw / norm_const  # matches loss-side normalization
+    var_shared = compute_shared_w_trajectory(
+        tau_theory, eigenvalues, w_vals, sigmas_np,
+        sigma_0=sigma_min, sigma_T=sigma_max, eta=ETA,
+    )
+    tau_shared = compute_emergence_times(var_shared, tau_theory, eigenvalues)
+    fit_shared = fit_power_law(tau_shared, eigenvalues)
+
     return {
         "alpha_heuristic": 1.0 + beta / 2.0,
+        # per-sigma
         "alpha_phi": fit_phi["alpha"],
         "alpha_phi_R2": fit_phi["R2"],
         "alpha_phi_n_used": fit_phi["n_used"],
         "emergence_times_phi": np.where(np.isnan(tau_phi), None, tau_phi).tolist(),
+        # shared-W (structurally correct for shared MLP)
+        "alpha_sharedW": fit_shared["alpha"],
+        "alpha_sharedW_R2": fit_shared["R2"],
+        "alpha_sharedW_n_used": fit_shared["n_used"],
+        "emergence_times_sharedW": np.where(np.isnan(tau_shared), None,
+                                            tau_shared).tolist(),
     }
 
 
-def train(args, X, eigenvalues, device):
-    model = MLPDenoiser(
-        ndim=args.ndim, nlayers=args.nlayers, nhidden=args.nhidden,
-        time_embed_dim=args.time_embed_dim,
-    ).to(device)
+def build_model(args, sigma_data):
+    if args.model_type == "pure":
+        return MLPDenoiser(
+            ndim=args.ndim, nlayers=args.nlayers, nhidden=args.nhidden,
+            time_embed_dim=args.time_embed_dim,
+        )
+    if args.model_type == "edm":
+        return EDMMLPDenoiser(
+            ndim=args.ndim, sigma_data=sigma_data,
+            nlayers=args.nlayers, nhidden=args.nhidden,
+            time_embed_dim=args.time_embed_dim,
+        )
+    raise ValueError(f"Unknown model_type: {args.model_type}")
+
+
+def train(args, X, eigenvalues, sigma_data, device):
+    model = build_model(args, sigma_data).to(device)
 
     loss_fn = SharedMLPPowerLawLoss(
         beta=args.beta, K_sigma=args.k_sigma,
-        sigma_min=SIGMA_0, sigma_max=SIGMA_T,
+        sigma_min=args.sigma_min, sigma_max=args.sigma_max,
         w_max=args.w_max, normalize=args.weight_norm,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -122,7 +161,7 @@ def train(args, X, eigenvalues, device):
             model.eval()
             var_per_mode = generated_variance_per_mode(
                 model, n_samples=args.n_eval_samples, ndim=args.ndim,
-                sigma_min=SIGMA_0, sigma_max=SIGMA_T,
+                sigma_min=args.sigma_min, sigma_max=args.sigma_max,
                 num_ode_steps=args.num_ode_steps, device=device,
             )
             model.train()
@@ -168,10 +207,25 @@ def main():
     p.add_argument("--warmup_steps", type=int, default=500,
                    help="Linear LR warmup steps. Prevents initial-descent trap.")
 
+    p.add_argument("--model_type", type=str, default="pure",
+                   choices=["pure", "edm"],
+                   help="pure = bare MLP backbone. edm = EDM preconditioning "
+                        "(c_in, c_out, c_skip, c_noise) wrapping the backbone. "
+                        "Use 'edm' for Experiment Y (realistic diffusion arch).")
+    p.add_argument("--sigma_data", type=float, default=None,
+                   help="Data std prior for EDM preconditioning. "
+                        "If None, auto-compute as sqrt(mean(eigenvalues)).")
     p.add_argument("--nlayers", type=int, default=4)
     p.add_argument("--nhidden", type=int, default=256)
     p.add_argument("--time_embed_dim", type=int, default=64)
     p.add_argument("--k_sigma", type=int, default=K_SIGMA)
+
+    p.add_argument("--sigma_min", type=float, default=SIGMA_0,
+                   help="Override global SIGMA_0. Defaults to config value.")
+    p.add_argument("--sigma_max", type=float, default=SIGMA_T,
+                   help="Override global SIGMA_T. Use ~2 for shared-MLP so "
+                        "sigma^2 range overlaps lambda range (else E[sigma^2] "
+                        "swamps lambda, flattening A_k, suppressing emergence).")
 
     p.add_argument("--w_max", type=float, default=None)
     p.add_argument("--weight_norm", type=str, default="mean",
@@ -195,21 +249,32 @@ def main():
           f"d={args.ndim} seed={args.seed} device={args.device}")
     print(f"  model: nlayers={args.nlayers} nhidden={args.nhidden} "
           f"embed={args.time_embed_dim}")
-    print(f"  loss:  K={args.k_sigma} w_max={args.w_max} "
-          f"norm={args.weight_norm}")
+    print(f"  sigma: [{args.sigma_min:g}, {args.sigma_max:g}]  "
+          f"K={args.k_sigma}")
+    print(f"  loss:  w_max={args.w_max} norm={args.weight_norm}")
 
     X, eigenvalues = generate_data(args.alpha_data, args.ndim, args.n_samples,
                                    args.seed)
 
-    print("Theory...")
-    theory = compute_theory(eigenvalues, args.beta, w_max=args.w_max,
-                            normalize=args.weight_norm)
-    print(f"  heuristic={_fmt(theory['alpha_heuristic'])} "
-          f"phi={_fmt(theory['alpha_phi'])} "
-          f"(R2={_fmt(theory['alpha_phi_R2'])})")
+    sigma_data = (args.sigma_data if args.sigma_data is not None
+                  else float(np.sqrt(eigenvalues.mean())))
+    print(f"  sigma_data={sigma_data:.4f}  "
+          f"({'user-set' if args.sigma_data is not None else 'auto'})")
 
-    print(f"Training {args.max_steps} steps (shared MLP, Adam lr={args.lr})...")
-    trained = train(args, X, eigenvalues, args.device)
+    print("Theory...")
+    theory = compute_theory(eigenvalues, args.beta,
+                            sigma_min=args.sigma_min, sigma_max=args.sigma_max,
+                            k_sigma=args.k_sigma, w_max=args.w_max,
+                            normalize=args.weight_norm)
+    print(f"  heuristic={_fmt(theory['alpha_heuristic'])}  "
+          f"per_sigma_phi={_fmt(theory['alpha_phi'])} "
+          f"(R2={_fmt(theory['alpha_phi_R2'])})  "
+          f"shared_W={_fmt(theory['alpha_sharedW'])} "
+          f"(R2={_fmt(theory['alpha_sharedW_R2'])})")
+
+    print(f"Training {args.max_steps} steps "
+          f"(model={args.model_type}, Adam lr={args.lr})...")
+    trained = train(args, X, eigenvalues, sigma_data, args.device)
     print(f"  alpha_trained={_fmt(trained['alpha_trained'])} "
           f"(R2={_fmt(trained['alpha_trained_R2'])}, "
           f"emerged={trained['n_emerged']}/{args.ndim}) "
@@ -217,13 +282,14 @@ def main():
 
     result = {
         "config": vars(args),
+        "sigma_data_used": sigma_data,
         "eigenvalues": eigenvalues.tolist(),
         **theory,
         **trained,
     }
 
-    fname = (f"mlp_b{args.beta:+.1f}_a{args.alpha_data:.2f}_d{args.ndim}"
-             f"_h{args.nhidden}_l{args.nlayers}_s{args.seed}.json")
+    fname = (f"mlp_{args.model_type}_b{args.beta:+.1f}_a{args.alpha_data:.2f}"
+             f"_d{args.ndim}_h{args.nhidden}_l{args.nlayers}_s{args.seed}.json")
     path = os.path.join(args.output_dir, fname)
     with open(path, "w") as f:
         json.dump(result, f, indent=2, default=str)

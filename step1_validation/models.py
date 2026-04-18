@@ -155,3 +155,48 @@ class MLPDenoiser(nn.Module):
             sigma = sigma.view(-1)
         t_enc = torch.log(sigma) / 4.0
         return self.backbone(x, t_enc, cond=cond)
+
+
+class EDMMLPDenoiser(nn.Module):
+    """EDM-preconditioned MLP denoiser (Karras et al. 2022, Table 1).
+
+        D(x, sigma) = c_skip(sigma) * x
+                    + c_out(sigma) * F_theta(c_in(sigma) * x, c_noise(sigma))
+
+    with
+        c_skip  = sigma_data^2 / (sigma^2 + sigma_data^2)
+        c_out   = sigma * sigma_data / sqrt(sigma^2 + sigma_data^2)
+        c_in    = 1 / sqrt(sigma^2 + sigma_data^2)
+        c_noise = log(sigma) / 4
+
+    Rationale: the preconditioning makes F_theta see approximately unit-
+    variance input at every sigma (c_in), scales its output so that the skip
+    connection dominates at low sigma (c_skip -> 1) and F dominates at high
+    sigma (c_out -> sigma_data). This is what every real diffusion model
+    does and is structurally sigma-dependent — a shared backbone wrapped
+    this way can in principle recover per-sigma-like dynamics.
+    """
+
+    def __init__(self, ndim, sigma_data, nlayers=5, nhidden=64,
+                 time_embed_dim=64):
+        super().__init__()
+        self.sigma_data = float(sigma_data)
+        self.backbone = UNetBlockStyleMLP_backbone_NoFirstNorm(
+            ndim=ndim, nlayers=nlayers, nhidden=nhidden,
+            time_embed_dim=time_embed_dim,
+        )
+
+    def forward(self, x, sigma, cond=None):
+        if sigma.ndim == 0:
+            sigma = sigma.expand(x.shape[0])
+        else:
+            sigma = sigma.view(-1)
+        sd = self.sigma_data
+        sig = sigma[:, None]                                 # [N, 1]
+        denom = torch.sqrt(sig ** 2 + sd ** 2)               # [N, 1]
+        c_skip = sd ** 2 / (sig ** 2 + sd ** 2)              # [N, 1]
+        c_out = sig * sd / denom                             # [N, 1]
+        c_in = 1.0 / denom                                   # [N, 1]
+        c_noise = torch.log(sigma) / 4.0                     # [N]
+        F_out = self.backbone(c_in * x, c_noise, cond=cond)
+        return c_skip * x + c_out * F_out

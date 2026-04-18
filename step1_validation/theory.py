@@ -71,6 +71,29 @@ def compute_shared_w_variance(a_k, sigma_0=SIGMA_0, sigma_T=SIGMA_T):
     return sigma_T**2 * (sigma_0 / sigma_T) ** (2.0 * (1.0 - a_k))
 
 
+def compute_shared_w_trajectory(tau_array, lambda_k_arr, w_values, sigma_grid,
+                                sigma_0=SIGMA_0, sigma_T=SIGMA_T, eta=ETA):
+    """Shared-W generated-variance trajectory [T, d].
+
+    Dynamics (gradient flow on a single W shared across sigma):
+        a_k(tau) = a_k_star * (1 - exp(-2 * eta * A_k * tau))
+        lambda_tilde_k(tau) = sigma_T^2 * (sigma_0/sigma_T)^{2(1 - a_k(tau))}
+
+    where A_k = E_sigma[w(sigma)*(lambda_k + sigma^2)] and
+          a_k_star = lambda_k * E_sigma[w] / A_k.
+
+    Applicable to any denoiser with parameters shared across sigma (shared
+    MLP included, in the convex / fixed-point limit).
+    """
+    A_k, a_k_star, _ = compute_A_k(lambda_k_arr, w_values, sigma_grid)
+    tau_array = np.asarray(tau_array, dtype=np.float64)
+
+    exponent = -2.0 * eta * tau_array[:, None] * A_k[None, :]  # [T, d]
+    a_k_traj = a_k_star[None, :] * (1.0 - np.exp(exponent))    # [T, d]
+    lambda_tilde = sigma_T ** 2 * (sigma_0 / sigma_T) ** (2.0 * (1.0 - a_k_traj))
+    return lambda_tilde
+
+
 # --- Emergence time computation ---
 
 def compute_emergence_times(variance_traj, tau_array, lambda_k_arr,

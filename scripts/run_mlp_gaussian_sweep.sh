@@ -40,6 +40,8 @@ $PYTHON -m step1_validation.run_mlp_sweep \
     --nhidden 256 \
     --nlayers 4 \
     --k_sigma 50 \
+    --sigma_min 0.002 \
+    --sigma_max 2.0 \
     --weight_norm mean \
     --n_checkpoints 80 \
     --n_eval_samples 5000 \
