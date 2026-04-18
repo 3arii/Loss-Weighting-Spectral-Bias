@@ -119,6 +119,65 @@ def compute_emergence_times(variance_traj, tau_array, lambda_k_arr,
     return tau_k_star
 
 
+def compute_emergence_times_relative(variance_traj, tau_array, lambda_k_arr,
+                                     threshold_frac=0.5, v_inf=None,
+                                     min_range_frac=1e-3):
+    """Relative-progress emergence time. Returns [d].
+
+    progress_k(t) = (v_k(t) - v_k(0)) / (v_k(inf) - v_k(0))
+    emergence_k   = first t where progress_k(t) >= threshold_frac
+
+    Use this for *empirical* trajectories (ODE-sampled from a trained model)
+    where the initial variance is determined by random-init sampling noise
+    rather than zero. Under a fixed-fraction rule (compute_emergence_times)
+    modes with small lambda_k are declared "emerged at step 0" because their
+    threshold is tiny, which fools the detector. Relative progress removes
+    that artifact by asking "when did each mode reach halfway between where
+    it started and where it ended up?" — a fully data-driven definition.
+
+    Args
+    ----
+    variance_traj : [T, d]  per-mode variance over checkpoints
+    tau_array     : [T]     checkpoint indices (steps or continuous tau)
+    lambda_k_arr  : [d]     data eigenvalues (used only for the min-range
+                            filter)
+    threshold_frac: float   progress level that counts as emergence (0.5 is
+                            the halfway point)
+    v_inf         : [d] or None. If None, empirical = variance_traj[-1].
+                    Pass lambda_k_arr to use the theoretical asymptote
+                    (more idealized but cleaner when training is converged).
+    min_range_frac: float   if |v_inf - v_0| < min_range_frac * |lambda_k|,
+                            the mode is treated as "did not move enough to
+                            measure" and returns NaN. Guards against the
+                            degenerate (flat) trajectory case.
+    """
+    variance_traj = np.asarray(variance_traj)
+    T, d = variance_traj.shape
+    tau_k_star = np.full(d, np.nan)
+
+    v_0 = variance_traj[0]
+    v_inf = variance_traj[-1] if v_inf is None else np.asarray(v_inf)
+    denom = v_inf - v_0
+
+    for k in range(d):
+        if abs(denom[k]) < min_range_frac * abs(lambda_k_arr[k]):
+            continue
+        progress = (variance_traj[:, k] - v_0[k]) / denom[k]
+        above = progress >= threshold_frac
+        if not np.any(above):
+            continue
+        idx = np.argmax(above)
+        if idx == 0:
+            tau_k_star[k] = tau_array[0]
+        else:
+            p0, p1 = progress[idx - 1], progress[idx]
+            t0, t1 = tau_array[idx - 1], tau_array[idx]
+            frac = ((threshold_frac - p0) / (p1 - p0)) if p1 != p0 else 0.5
+            tau_k_star[k] = t0 + frac * (t1 - t0)
+
+    return tau_k_star
+
+
 def compute_emergence_times_ak(a_k_traj, tau_array, a_k_star, convergence_frac=0.9):
     """a_k-based emergence: when a_k reaches convergence_frac * a_k*. Returns [d]."""
     d = a_k_traj.shape[1]

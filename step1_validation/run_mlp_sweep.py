@@ -24,7 +24,7 @@ from .losses import SharedMLPPowerLawLoss
 from .sampling import generated_variance_per_mode
 from .theory import (
     compute_phi_per_sigma, compute_shared_w_trajectory,
-    compute_emergence_times, fit_power_law,
+    compute_emergence_times, compute_emergence_times_relative, fit_power_law,
 )
 
 
@@ -180,18 +180,34 @@ def train(args, X, eigenvalues, sigma_data, device):
     var_traj = np.array(var_list)
     ckpt_arr = np.array(ckpt_list, dtype=np.float64)
 
-    tau_trained = compute_emergence_times(var_traj, ckpt_arr, eigenvalues)
-    fit_trained = fit_power_law(tau_trained, eigenvalues)
+    # Relative-progress emergence (primary metric for empirical trajectories):
+    # progress = (v(t)-v(0)) / (v(inf)-v(0)), threshold 0.5. Uses empirical
+    # v(inf) = last checkpoint. Robust to the random-init sampling artifact
+    # where small-lambda modes have threshold already exceeded at step 0.
+    tau_rel = compute_emergence_times_relative(var_traj, ckpt_arr, eigenvalues)
+    fit_rel = fit_power_law(tau_rel, eigenvalues)
+
+    # Fixed-fraction emergence (retained for parity with theory comparison).
+    tau_fixed = compute_emergence_times(var_traj, ckpt_arr, eigenvalues)
+    fit_fixed = fit_power_law(tau_fixed, eigenvalues)
 
     return {
         "var_traj": var_traj.tolist(),
         "ckpt_steps": ckpt_list,
-        "emergence_times_trained": np.where(np.isnan(tau_trained), None,
-                                            tau_trained).tolist(),
-        "alpha_trained": fit_trained["alpha"],
-        "alpha_trained_R2": fit_trained["R2"],
-        "alpha_trained_n_used": fit_trained["n_used"],
-        "n_emerged": int(np.sum(np.isfinite(tau_trained))),
+        # primary (relative-progress) metric
+        "emergence_times_trained": np.where(np.isnan(tau_rel), None,
+                                            tau_rel).tolist(),
+        "alpha_trained": fit_rel["alpha"],
+        "alpha_trained_R2": fit_rel["R2"],
+        "alpha_trained_n_used": fit_rel["n_used"],
+        "n_emerged": int(np.sum(np.isfinite(tau_rel))),
+        # legacy fixed-fraction metric (for comparison with theory numbers)
+        "emergence_times_fixed": np.where(np.isnan(tau_fixed), None,
+                                          tau_fixed).tolist(),
+        "alpha_trained_fixed": fit_fixed["alpha"],
+        "alpha_trained_fixed_R2": fit_fixed["R2"],
+        "alpha_trained_fixed_n_used": fit_fixed["n_used"],
+        # misc
         "loss_traj": loss_list,
         "max_grad_norm": max_grad,
         "train_time_s": train_time,
@@ -291,10 +307,14 @@ def main():
           + (f", mom={args.momentum}" if args.optimizer == "sgd" else "")
           + ")...")
     trained = train(args, X, eigenvalues, sigma_data, args.device)
-    print(f"  alpha_trained={_fmt(trained['alpha_trained'])} "
+    print(f"  alpha_trained (relative)   = {_fmt(trained['alpha_trained'])} "
           f"(R2={_fmt(trained['alpha_trained_R2'])}, "
-          f"emerged={trained['n_emerged']}/{args.ndim}) "
-          f"time={trained['train_time_s']:.0f}s")
+          f"emerged={trained['n_emerged']}/{args.ndim})")
+    print(f"  alpha_trained (fixed-frac) = "
+          f"{_fmt(trained['alpha_trained_fixed'])} "
+          f"(R2={_fmt(trained['alpha_trained_fixed_R2'])}, "
+          f"n_used={trained['alpha_trained_fixed_n_used']}/{args.ndim})")
+    print(f"  time={trained['train_time_s']:.0f}s")
 
     result = {
         "config": vars(args),
