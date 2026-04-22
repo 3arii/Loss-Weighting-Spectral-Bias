@@ -1,6 +1,6 @@
 """Loss functions for Step 1 validation."""
 
-from math import log10
+from math import exp, log10
 import torch
 
 from .config import K_SIGMA, SIGMA_0, SIGMA_T
@@ -108,3 +108,43 @@ class SharedMLPPowerLawLoss:
 
         per_sample_mse = ((D_out - X_batch) ** 2).sum(dim=-1)  # [N]
         return (w * per_sample_mse).mean()
+
+
+class BetaPowerEDMLoss:
+    """Binxu's EDMLoss with the Karras weight swapped for a power-law w(σ) = σ^β.
+
+    Mirrors `core/diffusion_edm_lib.py::EDMLoss` in DiffusionLearningCurve:
+      - σ ~ LogNormal(P_mean, P_std²) (continuous, one σ per sample per step)
+      - σ_data-free weight, because σ^β is what we want to sweep over
+      - x0 parameterization: loss = w(σ)·‖D(x + σ·ε, σ) - x‖²
+
+    The mean-normalization `w / E_LN[σ^β]` makes the effective learning rate
+    β-invariant (Binxu meeting-2 concern: unnormalized w confounds β with LR,
+    so β-sweep would also be an effective-LR sweep).
+
+    Key difference from SharedMLPPowerLawLoss:
+        old: σ sampled from a discrete K-point log-uniform grid → effective
+             weighting is σ^(β-1)/C (extra 1/σ from log-uniform density)
+        new: σ sampled continuously from LogNormal, matching Binxu's recipe
+             → effective weighting is w(σ) = σ^β exactly
+    """
+
+    def __init__(self, beta, P_mean=-1.2, P_std=1.2, normalize=True):
+        self.beta = beta
+        self.P_mean = P_mean
+        self.P_std = P_std
+        self.normalize = normalize
+        self.E_w = (exp(beta * P_mean + beta ** 2 * P_std ** 2 / 2.0)
+                    if normalize else 1.0)
+
+    def __call__(self, model, X):
+        """X: [N, d] clean samples. Returns scalar loss."""
+        N = X.shape[0]
+        device = X.device
+        rnd = torch.randn(N, device=device)
+        sigma = (rnd * self.P_std + self.P_mean).exp()        # [N]  LogNormal
+        weight = (sigma ** self.beta) / self.E_w              # [N]
+        noise = torch.randn_like(X) * sigma[:, None]
+        D = model(X + noise, sigma)                           # [N, d]
+        per_sample_mse = ((D - X) ** 2).sum(dim=-1)           # [N]
+        return (weight * per_sample_mse).mean()

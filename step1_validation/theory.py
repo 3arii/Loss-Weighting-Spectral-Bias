@@ -5,6 +5,8 @@ Also computes shared-W analytical predictions and a_k-based emergence.
 All vectorized — no Python loops over tau.
 """
 
+import math
+
 import numpy as np
 from numpy.polynomial.legendre import leggauss
 from sklearn.linear_model import LinearRegression
@@ -69,6 +71,62 @@ def compute_A_k(lambda_k_arr, w_values, sigma_grid):
 def compute_shared_w_variance(a_k, sigma_0=SIGMA_0, sigma_T=SIGMA_T):
     """lambda_tilde_k = sigma_T^2 * (sigma_0/sigma_T)^{2(1-a_k)}"""
     return sigma_T**2 * (sigma_0 / sigma_T) ** (2.0 * (1.0 - a_k))
+
+
+# --- Shared-W theory under continuous log-normal sigma sampling (Binxu recipe) ---
+
+def compute_sharedW_lognormal(lambda_k_arr, beta, P_mean=-1.2, P_std=1.2,
+                              normalize=True):
+    """Shared-W convergence rates for continuous LogNormal σ with w(σ) = σ^β.
+
+    Uses the log-normal moment identity:
+        E_{σ ~ LN(μ, s²)}[σ^k] = exp(k·μ + k²·s²/2)
+
+    so E_LN[w(σ)] and E_LN[w(σ)·σ²] are analytically available for any β,
+    without numerical integration or a discrete σ grid.
+
+    Returns:
+        dict with E_w, E_w_sigma2, lambda_crit, A_k [d], a_k_star [d].
+
+        lambda_crit = E[w·σ²] / E[w] is the transition eigenvalue: modes with
+        λ_k ≫ λ_crit are in the α≈1 spectral-bias regime; modes with
+        λ_k ≪ λ_crit are saturated (τ_k* ≈ const, α ≈ 0).
+    """
+    P_std2 = P_std ** 2
+    E_sig_b = math.exp(beta * P_mean + beta ** 2 * P_std2 / 2.0)
+    E_sig_b2 = math.exp((beta + 2) * P_mean + (beta + 2) ** 2 * P_std2 / 2.0)
+
+    if normalize:
+        E_w = 1.0
+        E_w_sigma2 = E_sig_b2 / E_sig_b
+    else:
+        E_w = E_sig_b
+        E_w_sigma2 = E_sig_b2
+
+    lambda_crit = E_w_sigma2 / E_w
+    lam = np.asarray(lambda_k_arr, dtype=np.float64)
+    A_k = lam * E_w + E_w_sigma2
+    a_k_star = lam * E_w / A_k
+    return dict(E_w=E_w, E_w_sigma2=E_w_sigma2, lambda_crit=lambda_crit,
+                A_k=A_k, a_k_star=a_k_star)
+
+
+def compute_sharedW_lognormal_trajectory(tau_array, lambda_k_arr, beta,
+                                          P_mean=-1.2, P_std=1.2,
+                                          sigma_0=SIGMA_0, sigma_T=SIGMA_T,
+                                          eta=ETA, normalize=True):
+    """[T, d] generated-variance trajectory under shared-W + LogNormal σ.
+
+    Same functional form as compute_shared_w_trajectory, but A_k and a_k_star
+    come from the analytic log-normal moments (compute_sharedW_lognormal)
+    rather than a .mean() over a log-uniform σ grid.
+    """
+    out = compute_sharedW_lognormal(lambda_k_arr, beta, P_mean, P_std, normalize)
+    A_k, a_k_star = out["A_k"], out["a_k_star"]
+    tau_array = np.asarray(tau_array, dtype=np.float64)
+    exponent = -2.0 * eta * tau_array[:, None] * A_k[None, :]
+    a_k_traj = a_k_star[None, :] * (1.0 - np.exp(exponent))
+    return sigma_T ** 2 * (sigma_0 / sigma_T) ** (2.0 * (1.0 - a_k_traj))
 
 
 def compute_shared_w_trajectory(tau_array, lambda_k_arr, w_values, sigma_grid,
